@@ -17,6 +17,7 @@ const TDX_CCTV_URL = "https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/CCT
 const TDX_TOKEN_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token";
 const tdxClientId = String(process.env.TDX_CLIENT_ID || "").trim();
 const tdxClientSecret = String(process.env.TDX_CLIENT_SECRET || "").trim();
+const enableLegacyHls = String(process.env.ENABLE_LEGACY_HLS || "").toLowerCase() === "true";
 const cameras = {
   "30001": process.env.CAMERA_30001_URL || "https://cctvn.freeway.gov.tw/abs2mjpg/bmjpg?camera=30001",
 };
@@ -133,6 +134,41 @@ async function resolveCameraSource(id) {
   return catalog.get(String(id))?.mediaUrl || null;
 }
 
+async function readJpegSnapshot(source) {
+  const upstream = await fetch(source, { headers: { Accept: "multipart/x-mixed-replace,image/jpeg,*/*" } });
+  if (!upstream.ok || !upstream.body) throw new Error(`upstream camera failed (${upstream.status})`);
+
+  const reader = upstream.body.getReader();
+  let buffer = Buffer.alloc(0);
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer = Buffer.concat([buffer, Buffer.from(value)]);
+      const start = buffer.indexOf(Buffer.from([0xff, 0xd8]));
+      const end = start >= 0 ? buffer.indexOf(Buffer.from([0xff, 0xd9]), start + 2) : -1;
+      if (end >= 0) return buffer.subarray(start, end + 2);
+      // Keep enough bytes to span a JPEG frame without allowing a broken source to grow memory indefinitely.
+      if (buffer.length > 4 * 1024 * 1024) buffer = buffer.subarray(-1024 * 1024);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+  }
+  throw new Error("upstream camera ended before a JPEG frame arrived");
+}
+
+async function serveSnapshot(response, id) {
+  const source = await resolveCameraSource(id);
+  if (!source) return sendJson(response, 404, { ok: false, error: "camera_not_found" });
+  const jpeg = await readJpegSnapshot(source);
+  response.writeHead(200, {
+    "Content-Type": "image/jpeg",
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Access-Control-Allow-Origin": "*",
+  });
+  response.end(jpeg);
+}
+
 function inferDirectionFromCameraId(id) {
   // TDX frequently leaves Direction blank, while freeway CCTV IDs carry the cardinal direction.
   const match = String(id || "").toUpperCase().match(/-(N|S|E|W)-/);
@@ -242,6 +278,11 @@ const server = createServer((request, response) => {
     return response.end(readFileSync(mjpegPlayerFile));
   }
 
+  const snapshotMatch = url.pathname.match(/^\/snapshot\/([A-Za-z0-9_.-]+)$/);
+  if (snapshotMatch) return void serveSnapshot(response, snapshotMatch[1]).catch((error) => {
+    if (!response.headersSent) sendJson(response, 502, { ok: false, error: "camera_snapshot_unavailable", detail: error.message });
+  });
+
   // TDX CCTV IDs include decimal mile markers, for example CCTV-N3-N-27.083-M.
   const mjpegMatch = url.pathname.match(/^\/mjpeg\/([A-Za-z0-9_.-]+)$/);
   if (mjpegMatch) return void streamBrowserMjpeg(response, mjpegMatch[1]).catch((error) => {
@@ -255,8 +296,11 @@ const server = createServer((request, response) => {
   return sendFile(response, join(streamDirectory(id), file));
 });
 
-for (const [id, source] of Object.entries(cameras)) startCamera(id, source, true);
-setInterval(ensureHealthyStreams, 3000).unref();
+// MJPEG is the production path. The legacy FFmpeg/HLS process costs CPU even without viewers.
+if (enableLegacyHls) {
+  for (const [id, source] of Object.entries(cameras)) startCamera(id, source, true);
+  setInterval(ensureHealthyStreams, 3000).unref();
+}
 server.listen(port, "0.0.0.0", () => console.log(`CCTV media relay listening on :${port}`));
 
 function shutdown() {
