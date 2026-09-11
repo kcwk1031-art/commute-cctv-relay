@@ -13,11 +13,16 @@ const startupGraceMs = Number(process.env.STREAM_STARTUP_GRACE_MS || 20000);
 const restartDelayMs = Number(process.env.RESTART_DELAY_MS || 250);
 const cameraCatalogUrl = String(process.env.CAMERA_CATALOG_URL || "").trim();
 const catalogCacheMs = 15 * 60 * 1000;
+const TDX_CCTV_URL = "https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/CCTV/Freeway?$format=JSON";
+const TDX_TOKEN_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token";
+const tdxClientId = String(process.env.TDX_CLIENT_ID || "").trim();
+const tdxClientSecret = String(process.env.TDX_CLIENT_SECRET || "").trim();
 const cameras = {
   "30001": process.env.CAMERA_30001_URL || "https://cctvn.freeway.gov.tw/abs2mjpg/bmjpg?camera=30001",
 };
 const processes = new Map();
 let catalogCache = { expiresAt: 0, cameras: new Map() };
+let tdxTokenCache = { expiresAt: 0, token: "" };
 
 function streamDirectory(id) {
   return join(streamRoot, id);
@@ -100,23 +105,73 @@ function sendFile(response, file) {
   createReadStream(file).pipe(response);
 }
 
-async function resolveCameraSource(id) {
-  if (cameras[id]) return cameras[id];
-  if (!cameraCatalogUrl) return null;
+async function getCameraCatalog() {
+  if (Date.now() < catalogCache.expiresAt) return catalogCache.cameras;
 
-  if (Date.now() >= catalogCache.expiresAt) {
+  let entries;
+  if (cameraCatalogUrl) {
     const response = await fetch(cameraCatalogUrl, { headers: { Accept: "application/json" } });
     if (!response.ok) throw new Error(`camera catalog failed (${response.status})`);
     const payload = await response.json();
-    const entries = Array.isArray(payload?.cameras) ? payload.cameras : [];
-    catalogCache = {
-      expiresAt: Date.now() + catalogCacheMs,
-      cameras: new Map(entries
-        .filter((camera) => camera?.id && /^https:\/\//i.test(String(camera.mediaUrl || "")))
-        .map((camera) => [String(camera.id), String(camera.mediaUrl)])),
-    };
+    entries = Array.isArray(payload?.cameras) ? payload.cameras : [];
+  } else {
+    entries = await getTdxCameras();
   }
-  return catalogCache.cameras.get(String(id)) || null;
+
+  catalogCache = {
+    expiresAt: Date.now() + catalogCacheMs,
+    cameras: new Map(entries
+      .filter((camera) => camera?.id && /^https:\/\//i.test(String(camera.mediaUrl || "")))
+      .map((camera) => [String(camera.id), camera])),
+  };
+  return catalogCache.cameras;
+}
+
+async function resolveCameraSource(id) {
+  if (cameras[id]) return cameras[id];
+  const catalog = await getCameraCatalog();
+  return catalog.get(String(id))?.mediaUrl || null;
+}
+
+async function getTdxCameras() {
+  const token = await getTdxAccessToken();
+  const response = await fetch(TDX_CCTV_URL, { headers: { Authorization: `Bearer ${token}` } });
+  if (!response.ok) throw new Error(`TDX CCTV request failed (${response.status})`);
+  const payload = await response.json();
+  return (payload.CCTVs || [])
+    .filter((camera) => camera.CCTVID && camera.VideoStreamURL && Number(camera.PositionLat) && Number(camera.PositionLon))
+    .map((camera) => ({
+      id: camera.CCTVID,
+      road: camera.RoadName || camera.RoadID || "國道路段",
+      direction: camera.Direction || "",
+      mile: camera.LocationMile || camera.Mile || "",
+      section: camera.LocationName || "",
+      lat: Number(camera.PositionLat),
+      lng: Number(camera.PositionLon),
+      mediaUrl: camera.VideoStreamURL,
+    }));
+}
+
+async function getTdxAccessToken() {
+  if (!tdxClientId || !tdxClientSecret) throw new Error("tdx_credentials_missing");
+  if (Date.now() < tdxTokenCache.expiresAt) return tdxTokenCache.token;
+
+  const body = new URLSearchParams({
+    grant_type: "client_credentials",
+    client_id: tdxClientId,
+    client_secret: tdxClientSecret,
+  });
+  const response = await fetch(TDX_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+  if (!response.ok) throw new Error(`TDX token request failed (${response.status})`);
+  const payload = await response.json();
+  if (!payload.access_token) throw new Error("TDX token response missing access_token");
+  const ttlMs = Math.max(60, Math.min(Number(payload.expires_in || 1500) - 60, 1500)) * 1000;
+  tdxTokenCache = { token: payload.access_token, expiresAt: Date.now() + ttlMs };
+  return tdxTokenCache.token;
 }
 
 async function streamBrowserMjpeg(response, id) {
@@ -153,6 +208,12 @@ const server = createServer((request, response) => {
       return [id, { state: ageMs <= staleAfterMs ? "ready" : "stale", ageMs: Number.isFinite(ageMs) ? Math.round(ageMs) : null, restarting: Boolean(entry?.restarting), error: entry?.lastError || null }];
     }));
     return sendJson(response, 200, { ok: Object.values(streams).every((item) => item.state === "ready"), streams });
+  }
+
+  if (url.pathname === "/v1/cameras") {
+    return void getCameraCatalog()
+      .then((catalog) => sendJson(response, 200, { updatedAt: new Date().toISOString(), cameras: [...catalog.values()] }))
+      .catch((error) => sendJson(response, 502, { ok: false, error: "camera_catalog_unavailable", detail: error.message }));
   }
 
   if (url.pathname === "/player") {
