@@ -133,6 +133,12 @@ async function resolveCameraSource(id) {
   return catalog.get(String(id))?.mediaUrl || null;
 }
 
+function inferDirectionFromCameraId(id) {
+  // TDX frequently leaves Direction blank, while freeway CCTV IDs carry the cardinal direction.
+  const match = String(id || "").toUpperCase().match(/-(N|S|E|W)-/);
+  return match ? ({ N: "北向", S: "南向", E: "東向", W: "西向" })[match[1]] : "";
+}
+
 async function getTdxCameras() {
   const token = await getTdxAccessToken();
   const response = await fetch(TDX_CCTV_URL, { headers: { Authorization: `Bearer ${token}` } });
@@ -143,7 +149,7 @@ async function getTdxCameras() {
     .map((camera) => ({
       id: camera.CCTVID,
       road: camera.RoadName || camera.RoadID || "國道路段",
-      direction: camera.Direction || "",
+      direction: camera.Direction || inferDirectionFromCameraId(camera.CCTVID),
       mile: camera.LocationMile || camera.Mile || "",
       section: camera.LocationName || "",
       lat: Number(camera.PositionLat),
