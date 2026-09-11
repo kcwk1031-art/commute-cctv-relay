@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0c5f55">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>道路駕駛總覽</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="stylesheet" href="drive.css">
+</head>
+<body class="drive-app">
+  <main class="drive-shell" aria-live="polite">
+    <header class="drive-header">
+      <div class="brand-block">
+        <p>道路駕駛</p>
+        <strong>即時道路總覽</strong>
+      </div>
+      <button class="quiet-button" id="openSettings" type="button">設定</button>
+    </header>
+
+    <section class="live-strip" aria-label="系統狀態">
+      <span class="source-chip" id="sourceChip" data-level="waiting">資料待命</span>
+      <strong id="locationState">定位未啟動</strong>
+    </section>
+
+    <section class="camera-panel" aria-label="前方道路影像">
+      <div class="camera-heading">
+        <div>
+          <p>前方即時影像</p>
+          <strong id="roadLabel">尚未確認路段</strong>
+        </div>
+        <span id="cameraStatus">影像待命</span>
+      </div>
+
+      <div class="camera-stage" id="cameraStage" data-state="waiting">
+        <img id="cctvImage" alt="前方道路監視器影像" hidden>
+        <div class="camera-placeholder" id="cameraPlaceholder">
+          <strong>尚未載入影像</strong>
+          <small>啟動後將依定位選擇前方道路鏡頭</small>
+        </div>
+        <div class="camera-overlay" id="cameraOverlay" hidden></div>
+      </div>
+
+      <div class="road-context" aria-label="鏡頭路段資訊">
+        <span id="roadDetail">定位後會依行進方向尋找前方道路影像。</span>
+        <span class="camera-age"><small>影像更新</small><strong id="cameraAge">--</strong></span>
+      </div>
+    </section>
+
+    <section class="metric-grid" aria-label="行車資訊">
+      <article class="metric-primary">
+        <span>GPS 車速</span>
+        <strong id="gpsSpeed">--</strong>
+        <small>km/h</small>
+      </article>
+      <article>
+        <span>前方鏡頭</span>
+        <strong id="cameraDistance">--</strong>
+        <small>距離</small>
+      </article>
+      <article>
+        <span>官方 VD</span>
+        <strong id="vdSpeed">--</strong>
+        <small>尚未連接</small>
+      </article>
+      <article>
+        <span>速限</span>
+        <strong id="speedLimit">--</strong>
+        <small>尚未驗證</small>
+      </article>
+    </section>
+
+    <section class="observation" id="observation" data-level="waiting">
+      <span>道路判讀狀態</span>
+      <strong id="observationTitle">等待定位</strong>
+      <small id="observationDetail">沒有可靠路段、速限或車道資料時，不提供車道建議。</small>
+    </section>
+  </main>
+
+  <div class="driver-dock">
+    <div class="driver-actions">
+      <button class="primary-action" id="startDrive" type="button">啟動即時道路資訊</button>
+      <button class="secondary-action" id="stopDrive" type="button" hidden>停止即時道路資訊</button>
+    </div>
+  </div>
+
+  <dialog class="settings-dialog" id="settingsDialog">
+    <form method="dialog" class="settings-form">
+      <div>
+        <p class="dialog-eyebrow">影像服務</p>
+        <h1>連線設定</h1>
+      </div>
+      <label>
+        鏡頭目錄 Proxy 網址
+        <input id="proxyEndpoint" type="url" inputmode="url" placeholder="https://你的-worker.workers.dev">
+      </label>
+      <label>
+        即時影像 Relay 網址
+        <input id="relayEndpoint" type="url" inputmode="url" placeholder="https://你的-relay.example.com">
+      </label>
+      <p class="dialog-note">目錄 Proxy 用來取得全台鏡頭位置；Relay 將官方影像轉為標準 JPEG MJPEG，避免 iPhone 破圖與 HLS 卡頓。<a href="privacy.html">隱私權說明</a></p>
+      <div class="dialog-actions">
+        <button class="secondary-action" value="cancel">取消</button>
+        <button class="primary-action" id="saveSettings" value="default">保存設定</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="drive-config.js"></script>
+  <script src="drive.js" defer></script>
+</body>
+</html>
