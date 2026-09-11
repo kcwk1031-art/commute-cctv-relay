@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>國道 CCTV 本機串流測試</title>
+  <style>
+    body { margin: 0; background: #081512; color: #edf7f2; font-family: system-ui, sans-serif; }
+    main { max-width: 960px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 24px; margin: 0 0 8px; }
+    p { color: #b7c8c0; }
+    video { width: 100%; display: block; background: #000; aspect-ratio: 16 / 9; }
+    #status { color: #70e2bb; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>國道 CCTV 本機串流測試</h1>
+    <p id="status">正在連線…</p>
+    <video id="player" controls autoplay muted playsinline></video>
+    <p>來源：官方攝影機 30001。此頁只供本機驗證；原始來源更新頻率約數秒一次。</p>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@1"></script>
+  <script>
+    const video = document.querySelector('#player');
+    const status = document.querySelector('#status');
+    const source = '/streams/30001/index.m3u8';
+    if (video.canPlayType('application/vnd.apple.mpegurl')) {
+      video.src = source;
+    } else if (window.Hls && Hls.isSupported()) {
+      // Stay behind the live edge. The official MJPEG feed briefly pauses on reconnect;
+      // a five-second buffer is preferable to a player that freezes every few seconds.
+      const hls = new Hls({
+        lowLatencyMode: false,
+        liveSyncDuration: 5,
+        liveMaxLatencyDuration: 10,
+        maxBufferLength: 20,
+        backBufferLength: 0,
+      });
+      hls.loadSource(source);
+      hls.attachMedia(video);
+      hls.on(Hls.Events.MANIFEST_PARSED, () => video.play().catch(() => {}));
+      hls.on(Hls.Events.ERROR, (_, data) => {
+        if (data.fatal) status.textContent = '串流暫時重連中，請等待數秒。';
+      });
+    } else {
+      status.textContent = '此瀏覽器不支援 HLS 播放。';
+    }
+    video.addEventListener('playing', () => { status.textContent = '已連線：本機 HLS 串流中'; });
+  </script>
+</body>
+</html>

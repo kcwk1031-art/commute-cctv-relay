@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>國道 CCTV 原生串流測試</title>
+  <style>
+    body { margin: 0; background: #081512; color: #edf7f2; font-family: system-ui, sans-serif; }
+    main { max-width: 960px; margin: 0 auto; padding: 24px; }
+    h1 { font-size: 24px; margin: 0 0 8px; }
+    p { color: #b7c8c0; }
+    #status { color: #70e2bb; font-weight: 700; }
+    img { width: 100%; display: block; background: #000; aspect-ratio: 16 / 9; object-fit: contain; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>國道 CCTV 原生串流測試</h1>
+    <p id="status">正在連線官方影像…</p>
+    <img id="camera" alt="國道即時影像" src="https://cctvn.freeway.gov.tw/abs2mjpg/jpg?camera=30000">
+    <p>此頁使用與 1968 網站相同的官方 MJPEG 直接呈現方式，不經 HLS 重新轉檔。</p>
+  </main>
+  <script>
+    const image = document.querySelector('#camera');
+    const status = document.querySelector('#status');
+    image.addEventListener('load', () => { status.textContent = '已連線：官方 MJPEG 原生串流中'; }, { once: true });
+    image.addEventListener('error', () => { status.textContent = '影像連線失敗，請重新整理後再試。'; });
+  </script>
+</body>
+</html>
