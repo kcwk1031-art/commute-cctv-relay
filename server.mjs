@@ -236,7 +236,8 @@ const server = createServer((request, response) => {
     return response.end(readFileSync(mjpegPlayerFile));
   }
 
-  const mjpegMatch = url.pathname.match(/^\/mjpeg\/([A-Za-z0-9_-]+)$/);
+  // TDX CCTV IDs include decimal mile markers, for example CCTV-N3-N-27.083-M.
+  const mjpegMatch = url.pathname.match(/^\/mjpeg\/([A-Za-z0-9_.-]+)$/);
   if (mjpegMatch) return void streamBrowserMjpeg(response, mjpegMatch[1]).catch((error) => {
     if (!response.headersSent) sendJson(response, 502, { ok: false, error: "camera_catalog_unavailable", detail: error.message });
   });
