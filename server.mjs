@@ -11,6 +11,8 @@ const mjpegPlayerFile = resolve(process.cwd(), "mjpeg-player.html");
 const staleAfterMs = Number(process.env.STREAM_STALE_MS || 12000);
 const startupGraceMs = Number(process.env.STREAM_STARTUP_GRACE_MS || 20000);
 const restartDelayMs = Number(process.env.RESTART_DELAY_MS || 250);
+const mjpegIdleMs = Math.max(5000, Number(process.env.MJPEG_IDLE_MS || 15000));
+const mjpegMaxClientBufferBytes = Math.max(256 * 1024, Number(process.env.MJPEG_MAX_CLIENT_BUFFER_BYTES || 1024 * 1024));
 const cameraCatalogUrl = String(process.env.CAMERA_CATALOG_URL || "").trim();
 const catalogCacheMs = 15 * 60 * 1000;
 const TDX_CCTV_URL = "https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/CCTV/Freeway?$format=JSON";
@@ -22,6 +24,8 @@ const cameras = {
   "30001": process.env.CAMERA_30001_URL || "https://cctvn.freeway.gov.tw/abs2mjpg/bmjpg?camera=30001",
 };
 const processes = new Map();
+const mjpegSessions = new Map();
+const mjpegSessionPromises = new Map();
 let catalogCache = { expiresAt: 0, cameras: new Map() };
 let tdxTokenCache = { expiresAt: 0, token: "" };
 
@@ -169,6 +173,13 @@ async function serveSnapshot(response, id) {
   response.end(jpeg);
 }
 
+function serveEmbeddedPlayer(response, id) {
+  const safeId = String(id).replace(/[^A-Za-z0-9_.-]/g, "");
+  const source = `/mjpeg/${encodeURIComponent(safeId)}`;
+  response.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+  response.end(`<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{margin:0;width:100%;height:100%;background:#071c18;overflow:hidden}img{display:block;width:100%;height:100%;object-fit:contain}</style></head><body><img id="camera" alt="國道即時影像" src="${source}"><script>const image=document.querySelector('#camera');image.addEventListener('error',()=>setTimeout(()=>{image.src='${source}?t='+Date.now()},3000));</script></body></html>`);
+}
+
 function inferDirectionFromCameraId(id) {
   // TDX frequently leaves Direction blank, while freeway CCTV IDs carry the cardinal direction.
   const match = String(id || "").toUpperCase().match(/-(N|S|E|W)-/);
@@ -216,29 +227,133 @@ async function getTdxAccessToken() {
   return tdxTokenCache.token;
 }
 
-async function streamBrowserMjpeg(response, id) {
-  const source = await resolveCameraSource(id);
-  if (!source) return sendJson(response, 404, { ok: false, error: "unknown camera" });
+function stopMjpegSession(id, session) {
+  if (mjpegSessions.get(id) !== session) return;
+  session.stopped = true;
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  if (session.restartTimer) clearTimeout(session.restartTimer);
+  if (session.child && !session.child.killed) session.child.kill("SIGKILL");
+  mjpegSessions.delete(id);
+}
 
-  // Chrome may render the official multipart BMP feed as black. Re-encode only the frame format
-  // to JPEG and preserve frame arrival order, avoiding HLS buffering and timestamp distortion.
+function scheduleMjpegSessionStop(id, session) {
+  if (session.clients.size || session.idleTimer) return;
+  session.idleTimer = setTimeout(() => {
+    session.idleTimer = null;
+    if (!session.clients.size) stopMjpegSession(id, session);
+  }, mjpegIdleMs);
+  session.idleTimer.unref();
+}
+
+function scheduleMjpegSessionRestart(session) {
+  if (session.stopped || !session.clients.size || session.restartTimer) return;
+  session.restartTimer = setTimeout(() => {
+    session.restartTimer = null;
+    startMjpegSession(session);
+  }, restartDelayMs);
+  session.restartTimer.unref();
+}
+
+function broadcastMjpegChunk(session, chunk) {
+  session.lastFrameAt = Date.now();
+  for (const response of session.clients) {
+    if (response.destroyed || response.writableEnded) {
+      session.clients.delete(response);
+      continue;
+    }
+    // A slow phone must not buffer unlimited video in the free relay process.
+    if (response.writableLength > mjpegMaxClientBufferBytes) {
+      response.destroy();
+      session.clients.delete(response);
+      continue;
+    }
+    response.write(chunk);
+  }
+  if (!session.clients.size) scheduleMjpegSessionStop(session.id, session);
+}
+
+function startMjpegSession(session) {
+  if (session.stopped || !session.clients.size || session.child) return;
   const child = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "warning",
     "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "1",
-    "-i", source,
+    "-i", session.source,
     "-an", "-c:v", "mjpeg", "-q:v", "4",
     "-f", "mpjpeg", "-boundary_tag", "cctv", "pipe:1",
   ], { stdio: ["ignore", "pipe", "pipe"] });
+  session.child = child;
+  session.startedAt = Date.now();
+  child.stderr.on("data", (chunk) => { session.lastError = chunk.toString().trim().slice(-400); });
+  child.stdout.on("data", (chunk) => broadcastMjpegChunk(session, chunk));
+  const restart = () => {
+    if (session.child !== child) return;
+    session.child = null;
+    scheduleMjpegSessionRestart(session);
+  };
+  child.on("exit", restart);
+  child.on("error", (error) => {
+    session.lastError = error.message;
+    restart();
+  });
+}
 
+function getOrCreateMjpegSession(id) {
+  const existing = mjpegSessions.get(id);
+  if (existing) return Promise.resolve(existing);
+  const pending = mjpegSessionPromises.get(id);
+  if (pending) return pending;
+  const creation = resolveCameraSource(id)
+    .then((source) => {
+      if (!source) return null;
+      const readySession = mjpegSessions.get(id);
+      if (readySession) return readySession;
+      const session = {
+        id,
+        source,
+        child: null,
+        clients: new Set(),
+        idleTimer: null,
+        restartTimer: null,
+        lastFrameAt: 0,
+        lastError: "",
+        startedAt: 0,
+        stopped: false,
+      };
+      mjpegSessions.set(id, session);
+      return session;
+    })
+    .finally(() => mjpegSessionPromises.delete(id));
+  mjpegSessionPromises.set(id, creation);
+  return creation;
+}
+
+function ensureHealthyMjpegSessions() {
+  for (const session of mjpegSessions.values()) {
+    if (!session.child || !session.clients.size || session.stopped) continue;
+    const latestActivity = session.lastFrameAt || session.startedAt;
+    if (latestActivity && Date.now() - latestActivity > startupGraceMs) session.child.kill("SIGKILL");
+  }
+}
+
+async function attachMjpegClient(response, id) {
+  const session = await getOrCreateMjpegSession(id);
+  if (!session) return sendJson(response, 404, { ok: false, error: "unknown_camera" });
+  if (session.idleTimer) clearTimeout(session.idleTimer);
+  session.idleTimer = null;
   response.writeHead(200, {
     "Content-Type": "multipart/x-mixed-replace; boundary=cctv",
     "Cache-Control": "no-store, no-cache, must-revalidate",
     "Connection": "keep-alive",
+    "Access-Control-Allow-Origin": "*",
   });
-  child.stdout.pipe(response);
-  const close = () => child.kill("SIGKILL");
-  response.on("close", close);
-  child.on("error", close);
+  session.clients.add(response);
+  const detach = () => {
+    if (!session.clients.delete(response)) return;
+    scheduleMjpegSessionStop(id, session);
+  };
+  response.once("close", detach);
+  response.once("error", detach);
+  startMjpegSession(session);
 }
 
 const server = createServer((request, response) => {
@@ -249,7 +364,14 @@ const server = createServer((request, response) => {
       const ageMs = latestSegmentAgeMs(id);
       return [id, { state: ageMs <= staleAfterMs ? "ready" : "stale", ageMs: Number.isFinite(ageMs) ? Math.round(ageMs) : null, restarting: Boolean(entry?.restarting), error: entry?.lastError || null }];
     }));
-    return sendJson(response, 200, { ok: Object.values(streams).every((item) => item.state === "ready"), streams });
+    const mjpeg = Object.fromEntries([...mjpegSessions.entries()].map(([id, session]) => [id, {
+      viewers: session.clients.size,
+      state: session.lastFrameAt && Date.now() - session.lastFrameAt <= staleAfterMs ? "ready" : "starting",
+      lastError: session.lastError || null,
+    }]));
+    const legacyHealthy = !enableLegacyHls || Object.values(streams).every((item) => item.state === "ready");
+    const mjpegHealthy = Object.values(mjpeg).every((item) => item.state === "ready");
+    return sendJson(response, 200, { ok: legacyHealthy && mjpegHealthy, streams, mjpeg });
   }
 
   if (url.pathname === "/v1/cameras") {
@@ -278,6 +400,9 @@ const server = createServer((request, response) => {
     return response.end(readFileSync(mjpegPlayerFile));
   }
 
+  const embedMatch = url.pathname.match(/^\/embed\/([A-Za-z0-9_.-]+)$/);
+  if (embedMatch) return void serveEmbeddedPlayer(response, embedMatch[1]);
+
   const snapshotMatch = url.pathname.match(/^\/snapshot\/([A-Za-z0-9_.-]+)$/);
   if (snapshotMatch) return void serveSnapshot(response, snapshotMatch[1]).catch((error) => {
     if (!response.headersSent) sendJson(response, 502, { ok: false, error: "camera_snapshot_unavailable", detail: error.message });
@@ -285,7 +410,7 @@ const server = createServer((request, response) => {
 
   // TDX CCTV IDs include decimal mile markers, for example CCTV-N3-N-27.083-M.
   const mjpegMatch = url.pathname.match(/^\/mjpeg\/([A-Za-z0-9_.-]+)$/);
-  if (mjpegMatch) return void streamBrowserMjpeg(response, mjpegMatch[1]).catch((error) => {
+  if (mjpegMatch) return void attachMjpegClient(response, mjpegMatch[1]).catch((error) => {
     if (!response.headersSent) sendJson(response, 502, { ok: false, error: "camera_catalog_unavailable", detail: error.message });
   });
 
@@ -301,10 +426,12 @@ if (enableLegacyHls) {
   for (const [id, source] of Object.entries(cameras)) startCamera(id, source, true);
   setInterval(ensureHealthyStreams, 3000).unref();
 }
+setInterval(ensureHealthyMjpegSessions, 3000).unref();
 server.listen(port, "0.0.0.0", () => console.log(`CCTV media relay listening on :${port}`));
 
 function shutdown() {
   for (const { child } of processes.values()) child.kill("SIGKILL");
+  for (const [id, session] of mjpegSessions) stopMjpegSession(id, session);
   server.close(() => process.exit(0));
 }
 process.on("SIGINT", shutdown);
