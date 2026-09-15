@@ -15,7 +15,10 @@ const mjpegIdleMs = Math.max(5000, Number(process.env.MJPEG_IDLE_MS || 15000));
 const mjpegMaxClientBufferBytes = Math.max(256 * 1024, Number(process.env.MJPEG_MAX_CLIENT_BUFFER_BYTES || 1024 * 1024));
 const cameraCatalogUrl = String(process.env.CAMERA_CATALOG_URL || "").trim();
 const catalogCacheMs = 15 * 60 * 1000;
+const vdCacheMs = Math.max(30 * 1000, Number(process.env.VD_CACHE_MS || 55 * 1000));
+const mjpegFpsWindowMs = Math.max(5 * 1000, Number(process.env.MJPEG_FPS_WINDOW_MS || 10 * 1000));
 const TDX_CCTV_URL = "https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/CCTV/Freeway?$format=JSON";
+const TDX_VD_URL = "https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/Live/VD/Freeway?$format=JSON";
 const TDX_TOKEN_URL = "https://tdx.transportdata.tw/auth/realms/TDXConnect/protocol/openid-connect/token";
 const tdxClientId = String(process.env.TDX_CLIENT_ID || "").trim();
 const tdxClientSecret = String(process.env.TDX_CLIENT_SECRET || "").trim();
@@ -28,6 +31,7 @@ const mjpegSessions = new Map();
 const mjpegSessionPromises = new Map();
 let catalogCache = { expiresAt: 0, cameras: new Map() };
 let tdxTokenCache = { expiresAt: 0, token: "" };
+const vdCacheByRoute = new Map();
 
 function streamDirectory(id) {
   return join(streamRoot, id);
@@ -165,12 +169,24 @@ async function serveSnapshot(response, id) {
   const source = await resolveCameraSource(id);
   if (!source) return sendJson(response, 404, { ok: false, error: "camera_not_found" });
   const jpeg = await readJpegSnapshot(source);
+  sendJpeg(response, jpeg);
+}
+
+function sendJpeg(response, jpeg) {
   response.writeHead(200, {
     "Content-Type": "image/jpeg",
     "Cache-Control": "no-store, no-cache, must-revalidate",
     "Access-Control-Allow-Origin": "*",
   });
   response.end(jpeg);
+}
+
+async function serveLatestSnapshot(response, id) {
+  const session = mjpegSessions.get(id);
+  const newestFrameIsUsable = session?.latestJpeg
+    && Date.now() - session.latestJpegAt <= staleAfterMs;
+  if (newestFrameIsUsable) return sendJpeg(response, session.latestJpeg);
+  return serveSnapshot(response, id);
 }
 
 function serveEmbeddedPlayer(response, id) {
@@ -227,6 +243,188 @@ async function getTdxAccessToken() {
   return tdxTokenCache.token;
 }
 
+function asArray(value, nestedKey = "") {
+  if (Array.isArray(value)) return value;
+  if (nestedKey && Array.isArray(value?.[nestedKey])) return value[nestedKey];
+  return [];
+}
+
+function parseKilometers(value) {
+  const text = String(value || "").trim().toUpperCase();
+  const kilometerMatch = text.match(/(\d+(?:\.\d+)?)\s*K\s*\+\s*(\d+(?:\.\d+)?)/);
+  if (kilometerMatch) return Number(kilometerMatch[1]) + Number(kilometerMatch[2]) / 1000;
+  const decimalMatch = text.match(/(\d+(?:\.\d+)?)/);
+  return decimalMatch ? Number(decimalMatch[1]) : NaN;
+}
+
+function routeFromCameraId(id) {
+  return String(id || "").toUpperCase().match(/^CCTV-(N\d+[A-Z]?)-/)?.[1] || "";
+}
+
+function routeFromVdId(id) {
+  const match = String(id || "").toUpperCase().match(/(?:^|-)N(\d+[A-Z]?)(?:-|$)/);
+  return match ? `N${match[1]}` : "";
+}
+
+function directionFromId(id) {
+  return String(id || "").toUpperCase().match(/-(N|S|E|W)-/)?.[1] || "";
+}
+
+function mileFromVdId(id) {
+  const text = String(id || "");
+  const directionIndex = text.toUpperCase().search(/-(N|S|E|W)-/);
+  const afterDirection = directionIndex >= 0 ? text.slice(directionIndex + 3) : text;
+  const match = afterDirection.match(/(?:^|-)(\d{1,3}(?:\.\d+)?)(?:-|$)/);
+  return match ? Number(match[1]) : NaN;
+}
+
+function metricNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function normalizeLane(rawLane) {
+  const vehicles = asArray(rawLane?.Vehicles, "Vehicle");
+  const volume = vehicles.reduce((total, vehicle) => total + (metricNumber(vehicle?.Volume) ?? 0), 0);
+  return {
+    laneId: String(rawLane?.LaneID ?? ""),
+    laneType: Number(rawLane?.LaneType) || null,
+    speedKph: metricNumber(rawLane?.Speed),
+    occupancy: metricNumber(rawLane?.Occupancy),
+    volume,
+  };
+}
+
+function normalizeLinkFlows(vd) {
+  return asArray(vd?.LinkFlows, "LinkFlow")
+    .map((linkFlow) => ({
+      linkId: String(linkFlow?.LinkID || ""),
+      lanes: asArray(linkFlow?.Lanes, "Lane")
+        .map(normalizeLane)
+        .filter((lane) => lane.laneId),
+    }))
+    .filter((linkFlow) => linkFlow.lanes.length);
+}
+
+function isMainlineLane(lane) {
+  // TDX lane codes 1, 2 and 3 are general, fast and slow lanes. Exclude shoulders and auxiliary lanes.
+  return [1, 2, 3].includes(lane.laneType) && lane.speedKph !== null;
+}
+
+function buildFlowReference(lanes) {
+  const candidates = lanes.filter(isMainlineLane);
+  if (candidates.length < 2) {
+    return { state: "insufficient", label: "主線車道資料不足", detail: "未取得至少兩條有效主線車道資料，不比較車道。" };
+  }
+
+  const scored = candidates.map((lane) => ({
+    ...lane,
+    score: lane.speedKph - (lane.occupancy ?? 0) * 0.35,
+  })).sort((a, b) => b.score - a.score);
+  const [best, next] = scored;
+  const speedGap = best.speedKph - next.speedKph;
+  const occupancyGap = (next.occupancy ?? 0) - (best.occupancy ?? 0);
+  if (speedGap < 8 && occupancyGap < 5) {
+    return {
+      state: "similar",
+      label: "各主線車道差異不明顯",
+      detail: "官方 VD 資料未顯示足夠差異，維持原車道較合適。",
+    };
+  }
+
+  return {
+    state: "reference",
+    bestLaneId: best.laneId,
+    label: `第 ${best.laneId} 車道車流較順`,
+    detail: `官方 VD 顯示 ${best.speedKph} km/h，較下一車道快 ${Math.round(speedGap)} km/h。僅供路況參考，不構成變換車道指令。`,
+  };
+}
+
+async function getTdxVdLives(route) {
+  const cached = vdCacheByRoute.get(route);
+  if (cached && Date.now() < cached.expiresAt) return cached.records;
+
+  const token = await getTdxAccessToken();
+  const headers = { Authorization: `Bearer ${token}` };
+  const requestUrl = new URL(TDX_VD_URL);
+  if (route) requestUrl.searchParams.set("$filter", `contains(VDID,'${route}')`);
+  let response = await fetch(requestUrl, { headers });
+  // Some TDX deployments reject OData contains filters. Retrying the base endpoint keeps the feature available.
+  if (!response.ok && route) response = await fetch(TDX_VD_URL, { headers });
+  if (!response.ok) throw new Error(`TDX VD request failed (${response.status})`);
+  const payload = await response.json();
+  let records = asArray(payload?.VDLives || payload, "VDLive")
+    .filter((vd) => !route || routeFromVdId(vd?.VDID) === route);
+  // A few gateways accept an unsupported filter but return an empty 200 response.
+  if (route && !records.length && requestUrl.href !== TDX_VD_URL) {
+    const fallback = await fetch(TDX_VD_URL, { headers });
+    if (!fallback.ok) throw new Error(`TDX VD fallback request failed (${fallback.status})`);
+    const fallbackPayload = await fallback.json();
+    records = asArray(fallbackPayload?.VDLives || fallbackPayload, "VDLive")
+      .filter((vd) => routeFromVdId(vd?.VDID) === route);
+  }
+  vdCacheByRoute.set(route, { expiresAt: Date.now() + vdCacheMs, records });
+  return records;
+}
+
+async function getLaneObservation(cameraId) {
+  const catalog = await getCameraCatalog();
+  const camera = catalog.get(String(cameraId));
+  if (!camera) return { ok: false, error: "camera_not_found" };
+
+  const route = routeFromCameraId(camera.id);
+  const direction = directionFromId(camera.id);
+  const cameraMile = parseKilometers(camera.mile);
+  if (!route || !direction || !Number.isFinite(cameraMile)) {
+    return { ok: false, error: "camera_route_not_resolved" };
+  }
+
+  const candidates = (await getTdxVdLives(route))
+    .map((vd) => {
+      const mile = mileFromVdId(vd?.VDID);
+      const linkFlows = normalizeLinkFlows(vd);
+      return {
+        id: String(vd?.VDID || ""),
+        direction: directionFromId(vd?.VDID),
+        mile,
+        status: Number(vd?.Status),
+        dataCollectTime: vd?.DataCollectTime || vd?.UpdateTime || "",
+        linkFlows,
+        distanceKm: Number.isFinite(mile) ? Math.abs(mile - cameraMile) : Infinity,
+      };
+    })
+    .filter((vd) => vd.direction === direction && vd.status === 0 && vd.linkFlows.length && Number.isFinite(vd.distanceKm))
+    .sort((left, right) => left.distanceKm - right.distanceKm);
+
+  const nearest = candidates[0];
+  if (!nearest || nearest.distanceKm > 3) {
+    return {
+      ok: false,
+      error: "nearby_vd_not_available",
+      camera: { id: camera.id, road: camera.road, direction: camera.direction, mile: camera.mile },
+    };
+  }
+
+  const mainFlow = [...nearest.linkFlows]
+    .sort((left, right) => right.lanes.filter(isMainlineLane).length - left.lanes.filter(isMainlineLane).length)[0];
+  const lanes = mainFlow.lanes.sort((left, right) => Number(left.laneId) - Number(right.laneId));
+  const mainLaneCount = lanes.filter(isMainlineLane).length;
+  return {
+    ok: true,
+    updatedAt: new Date().toISOString(),
+    camera: { id: camera.id, road: camera.road, direction: camera.direction, mile: camera.mile },
+    vd: {
+      id: nearest.id,
+      distanceKm: Number(nearest.distanceKm.toFixed(2)),
+      dataCollectTime: nearest.dataCollectTime,
+      linkId: mainFlow.linkId,
+    },
+    mainLaneCount,
+    lanes,
+    flowReference: buildFlowReference(lanes),
+  };
+}
+
 function stopMjpegSession(id, session) {
   if (mjpegSessions.get(id) !== session) return;
   session.stopped = true;
@@ -254,7 +452,52 @@ function scheduleMjpegSessionRestart(session) {
   session.restartTimer.unref();
 }
 
+function noteMjpegFrames(session, chunk) {
+  const now = Date.now();
+  for (const byte of chunk) {
+    if (session.lastMjpegByte === 0xff && byte === 0xd8) {
+      session.frameTimes.push(now);
+      session.frameCount += 1;
+    }
+    session.lastMjpegByte = byte;
+  }
+  const cutoff = now - mjpegFpsWindowMs;
+  while (session.frameTimes.length && session.frameTimes[0] < cutoff) session.frameTimes.shift();
+}
+
+function captureLatestJpeg(session, chunk) {
+  session.jpegBuffer = Buffer.concat([session.jpegBuffer, chunk]);
+  let cursor = 0;
+  while (true) {
+    const start = session.jpegBuffer.indexOf(Buffer.from([0xff, 0xd8]), cursor);
+    const end = start >= 0
+      ? session.jpegBuffer.indexOf(Buffer.from([0xff, 0xd9]), start + 2)
+      : -1;
+    if (start < 0 || end < 0) break;
+    session.latestJpeg = Buffer.from(session.jpegBuffer.subarray(start, end + 2));
+    session.latestJpegAt = Date.now();
+    cursor = end + 2;
+  }
+  if (cursor) {
+    session.jpegBuffer = session.jpegBuffer.subarray(cursor);
+  } else if (session.jpegBuffer.length > 4 * 1024 * 1024) {
+    const lastStart = session.jpegBuffer.lastIndexOf(Buffer.from([0xff, 0xd8]));
+    session.jpegBuffer = lastStart >= 0
+      ? session.jpegBuffer.subarray(lastStart)
+      : session.jpegBuffer.subarray(-1024 * 1024);
+  }
+}
+
+function observedMjpegFps(session, now = Date.now()) {
+  if (!session.frameTimes.length) return 0;
+  const firstFrameAt = session.frameTimes[0];
+  const sampleMs = Math.max(1000, now - Math.max(firstFrameAt, session.startedAt || firstFrameAt));
+  return Number((session.frameTimes.length * 1000 / sampleMs).toFixed(1));
+}
+
 function broadcastMjpegChunk(session, chunk) {
+  captureLatestJpeg(session, chunk);
+  noteMjpegFrames(session, chunk);
   session.lastFrameAt = Date.now();
   for (const response of session.clients) {
     if (response.destroyed || response.writableEnded) {
@@ -277,12 +520,18 @@ function startMjpegSession(session) {
   const child = spawn("ffmpeg", [
     "-hide_banner", "-loglevel", "warning",
     "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "1",
+    // Source timestamps are frequently declared as 25 FPS despite frames arriving slower.
+    // Use arrival time and packet copy so the relay does not queue or invent frames.
+    "-fflags", "+nobuffer+genpts", "-use_wallclock_as_timestamps", "1",
+    "-analyzeduration", "0", "-probesize", "32",
     "-i", session.source,
-    "-an", "-c:v", "mjpeg", "-q:v", "4",
-    "-f", "mpjpeg", "-boundary_tag", "cctv", "pipe:1",
+    "-map", "0:v:0", "-an", "-c:v", "copy",
+    "-f", "mpjpeg", "-boundary_tag", "cctv", "-flush_packets", "1", "pipe:1",
   ], { stdio: ["ignore", "pipe", "pipe"] });
   session.child = child;
   session.startedAt = Date.now();
+  session.frameTimes = [];
+  session.lastMjpegByte = -1;
   child.stderr.on("data", (chunk) => { session.lastError = chunk.toString().trim().slice(-400); });
   child.stdout.on("data", (chunk) => broadcastMjpegChunk(session, chunk));
   const restart = () => {
@@ -313,11 +562,17 @@ function getOrCreateMjpegSession(id) {
         child: null,
         clients: new Set(),
         idleTimer: null,
-        restartTimer: null,
-        lastFrameAt: 0,
-        lastError: "",
-        startedAt: 0,
-        stopped: false,
+      restartTimer: null,
+      lastFrameAt: 0,
+      lastError: "",
+      startedAt: 0,
+      frameTimes: [],
+      frameCount: 0,
+      lastMjpegByte: -1,
+      latestJpeg: null,
+      latestJpegAt: 0,
+      jpegBuffer: Buffer.alloc(0),
+      stopped: false,
       };
       mjpegSessions.set(id, session);
       return session;
@@ -367,6 +622,7 @@ const server = createServer((request, response) => {
     const mjpeg = Object.fromEntries([...mjpegSessions.entries()].map(([id, session]) => [id, {
       viewers: session.clients.size,
       state: session.lastFrameAt && Date.now() - session.lastFrameAt <= staleAfterMs ? "ready" : "starting",
+      observedFps: observedMjpegFps(session),
       lastError: session.lastError || null,
     }]));
     const legacyHealthy = !enableLegacyHls || Object.values(streams).every((item) => item.state === "ready");
@@ -378,6 +634,32 @@ const server = createServer((request, response) => {
     return void getCameraCatalog()
       .then((catalog) => sendJson(response, 200, { updatedAt: new Date().toISOString(), cameras: [...catalog.values()] }))
       .catch((error) => sendJson(response, 502, { ok: false, error: "camera_catalog_unavailable", detail: error.message }));
+  }
+
+  const laneMatch = url.pathname.match(/^\/v1\/lanes\/([A-Za-z0-9_.-]+)$/);
+  if (laneMatch) return void getLaneObservation(laneMatch[1])
+    .then((observation) => sendJson(response, observation.ok ? 200 : 404, observation))
+    .catch((error) => sendJson(response, 502, { ok: false, error: "lane_data_unavailable", detail: error.message }));
+
+  const metricsMatch = url.pathname.match(/^\/v1\/stream-metrics\/([A-Za-z0-9_.-]+)$/);
+  if (metricsMatch) {
+    const session = mjpegSessions.get(metricsMatch[1]);
+    if (!session) return sendJson(response, 200, {
+      ok: true,
+      cameraId: metricsMatch[1],
+      state: "not_streaming",
+      observedFps: 0,
+      viewers: 0,
+    });
+    return sendJson(response, 200, {
+      ok: true,
+      cameraId: metricsMatch[1],
+      state: session.lastFrameAt && Date.now() - session.lastFrameAt <= staleAfterMs ? "ready" : "starting",
+      observedFps: observedMjpegFps(session),
+      viewers: session.clients.size,
+      framesDelivered: session.frameCount,
+      startedAt: session.startedAt ? new Date(session.startedAt).toISOString() : null,
+    });
   }
 
   if (url.pathname === "/player") {
@@ -405,6 +687,11 @@ const server = createServer((request, response) => {
 
   const snapshotMatch = url.pathname.match(/^\/snapshot\/([A-Za-z0-9_.-]+)$/);
   if (snapshotMatch) return void serveSnapshot(response, snapshotMatch[1]).catch((error) => {
+    if (!response.headersSent) sendJson(response, 502, { ok: false, error: "camera_snapshot_unavailable", detail: error.message });
+  });
+
+  const latestMatch = url.pathname.match(/^\/latest\/([A-Za-z0-9_.-]+)$/);
+  if (latestMatch) return void serveLatestSnapshot(response, latestMatch[1]).catch((error) => {
     if (!response.headersSent) sendJson(response, 502, { ok: false, error: "camera_snapshot_unavailable", detail: error.message });
   });
 
