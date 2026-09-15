@@ -1,6 +1,17 @@
 # CCTV Media Relay
 
-This service receives an official MJPEG camera feed, rebuilds its timestamps from actual arrival time, converts it to low-latency HLS, and exposes a health endpoint. iPhone Safari can play the resulting `index.m3u8` through a native `<video>` element. The relay reconnects automatically when an upstream MJPEG response ends.
+## TDX camera catalog
+
+For GPS-based camera selection, set these Render environment variables:
+
+```text
+TDX_CLIENT_ID=<TDX Client ID>
+TDX_CLIENT_SECRET=<TDX Client Secret>
+```
+
+The service then exposes `GET /v1/cameras`. Keep both values in Render only; never commit them to GitHub or put them in the App.
+
+This service fans one official MJPEG source out to multiple viewers without re-encoding it. The relay reconnects automatically when an upstream MJPEG response ends, reports observed frame arrival rate, and reads the official TDX VD feed for per-lane traffic data.
 
 ## Local test
 
@@ -16,11 +27,13 @@ cd media-relay
 npm start
 ```
 
-Check `http://localhost:8788/health`. When state is `ready`, the HLS playlist is:
+Check `http://localhost:8788/health`. For the current source frame rate and viewer count, use:
+
+`http://localhost:8788/v1/stream-metrics/30001`
 
 建議直接觀看：`http://localhost:8788/player`
 
-這是將官方 MJPEG 轉為瀏覽器可顯示的標準 JPEG MJPEG，避免 Chrome 黑屏與 HLS 緩衝卡頓。HLS 診斷頁保留於 `http://localhost:8788/hls-player`，不作為目前建議方案。
+這是將官方 MJPEG 以低延遲方式轉送給瀏覽器，不使用 HLS 緩衝。HLS 診斷頁保留於 `http://localhost:8788/hls-player`，不作為目前建議方案。
 
 HLS 播放清單仍可供技術測試：
 
@@ -30,21 +43,22 @@ HLS 播放清單仍可供技術測試：
 
 ## App integration
 
-The driving app uses two public HTTPS service URLs:
+The driving app can use this one public HTTPS Relay URL for both `鏡頭目錄 Proxy 網址` and `即時影像 Relay 網址`.
 
-1. `鏡頭目錄 Proxy 網址`: the existing Cloudflare Worker URL, which exposes `/v1/cameras`.
-2. `即時影像 Relay 網址`: this Docker service URL.
+The Relay exposes:
 
-Deploy the relay with `CAMERA_CATALOG_URL=https://<your-worker>/v1/cameras`. The relay resolves the selected camera ID through that catalog server-side and exposes it as `/mjpeg/<camera-id>`. The browser never receives a TDX credential.
+- `GET /mjpeg/<camera-id>`: shared low-latency MJPEG stream
+- `GET /embed/<camera-id>`: browser-safe embedded player
+- `GET /latest/<camera-id>`: latest JPEG from an active shared stream, for low-frequency analysis without opening a second upstream feed
+- `GET /v1/stream-metrics/<camera-id>`: observed source FPS and active viewer count
+- `GET /v1/lanes/<camera-id>`: nearest same-direction official VD main-lane count, lane speed, occupancy and volume
+
+The driving app prefers the official MJPEG source for lowest latency and automatically falls back to `/mjpeg/<camera-id>` if the phone cannot play it. TDX credentials remain only in Render.
 
 ## Production requirement
 
-Deploy this Docker service on an always-on container host. GitHub Pages cannot perform MJPEG-to-HLS transcoding. The deployed service URL is then used by the web app's native HLS player.
-
-## Health rule
-
-No new HLS segment for 12 seconds is `stale`; the relay kills and restarts that camera process. A player must display a reconnecting state rather than claim the image is live.
+Deploy this Docker service on an always-on container host. GitHub Pages cannot proxy live MJPEG or read protected TDX VD data. The deployed service URL is then used by the web app as the fallback stream and official lane-data service.
 
 ## Source-rate limit
 
-The tested official camera feed supplies roughly five frames per second. The source reports 25fps timestamps despite that arrival rate, so the relay stretches the timestamp timeline fivefold before HLS conversion. This produces continuous real-time 5fps playback rather than a fast burst followed by a freeze. It cannot create genuine 25/30-fps video; that would require a separately licensed higher-frame-rate source.
+Frame rate is camera-specific. On 2026-09-14, sample freeway cameras were measured at roughly 9-13 actual frames per second despite reporting 25 FPS in their headers. The relay never duplicates frames to claim a higher rate. It can reduce relay latency, but genuine 15/30 FPS requires an upstream source that supplies that many new frames.

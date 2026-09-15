@@ -196,10 +196,18 @@ function serveEmbeddedPlayer(response, id) {
   response.end(`<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{margin:0;width:100%;height:100%;background:#071c18;overflow:hidden}img{display:block;width:100%;height:100%;object-fit:contain}</style></head><body><img id="camera" alt="國道即時影像" src="${source}"><script>const image=document.querySelector('#camera');image.addEventListener('error',()=>setTimeout(()=>{image.src='${source}?t='+Date.now()},3000));</script></body></html>`);
 }
 
-function inferDirectionFromCameraId(id) {
-  // TDX frequently leaves Direction blank, while freeway CCTV IDs carry the cardinal direction.
-  const match = String(id || "").toUpperCase().match(/-(N|S|E|W)-/);
-  return match ? ({ N: "北向", S: "南向", E: "東向", W: "西向" })[match[1]] : "";
+function directionCode(value, id = "") {
+  const text = String(value || "").trim().toUpperCase();
+  if (/北|NORTH|(?:^|[-_\s])N(?:$|[-_\s])/.test(text)) return "N";
+  if (/南|SOUTH|(?:^|[-_\s])S(?:$|[-_\s])/.test(text)) return "S";
+  if (/東|EAST|(?:^|[-_\s])E(?:$|[-_\s])/.test(text)) return "E";
+  if (/西|WEST|(?:^|[-_\s])W(?:$|[-_\s])/.test(text)) return "W";
+  // The highway CCTV ID is the authoritative fallback when TDX Direction is blank or non-standard.
+  return String(id || "").toUpperCase().match(/-(N|S|E|W)-/)?.[1] || "";
+}
+
+function normalizedCameraDirection(value, id) {
+  return ({ N: "北向", S: "南向", E: "東向", W: "西向" })[directionCode(value, id)] || "";
 }
 
 async function getTdxCameras() {
@@ -212,7 +220,7 @@ async function getTdxCameras() {
     .map((camera) => ({
       id: camera.CCTVID,
       road: camera.RoadName || camera.RoadID || "國道路段",
-      direction: camera.Direction || inferDirectionFromCameraId(camera.CCTVID),
+      direction: normalizedCameraDirection(camera.Direction, camera.CCTVID),
       mile: camera.LocationMile || camera.Mile || "",
       section: camera.LocationName || "",
       lat: Number(camera.PositionLat),
