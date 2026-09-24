@@ -16,7 +16,8 @@ const mjpegIdleMs = Math.max(5000, Number(process.env.MJPEG_IDLE_MS || 15000));
 const mjpegMaxClientBufferBytes = Math.max(256 * 1024, Number(process.env.MJPEG_MAX_CLIENT_BUFFER_BYTES || 1024 * 1024));
 const cameraCatalogUrl = String(process.env.CAMERA_CATALOG_URL || "").trim();
 const catalogCacheMs = 15 * 60 * 1000;
-const vdCacheMs = Math.max(30 * 1000, Number(process.env.VD_CACHE_MS || 55 * 1000));
+const vdCacheMs = Math.max(30 * 1000, Number(process.env.VD_CACHE_MS || 120 * 1000));
+const vdRetryAfterFailureMs = Math.max(10 * 1000, Number(process.env.VD_RETRY_AFTER_FAILURE_MS || 30 * 1000));
 const mjpegFpsWindowMs = Math.max(5 * 1000, Number(process.env.MJPEG_FPS_WINDOW_MS || 10 * 1000));
 const TDX_CCTV_URL = "https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/CCTV/Freeway?$format=JSON";
 const TDX_VD_URL = "https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/Live/VD/Freeway?$format=JSON";
@@ -33,6 +34,7 @@ const mjpegSessionPromises = new Map();
 let catalogCache = { expiresAt: 0, cameras: new Map() };
 let tdxTokenCache = { expiresAt: 0, token: "" };
 const vdCacheByRoute = new Map();
+const vdRequestsByRoute = new Map();
 
 function streamDirectory(id) {
   return join(streamRoot, id);
@@ -358,27 +360,46 @@ async function getTdxVdLives(route) {
   const cached = vdCacheByRoute.get(route);
   if (cached && Date.now() < cached.expiresAt) return cached.records;
 
-  const token = await getTdxAccessToken();
-  const headers = { Authorization: `Bearer ${token}` };
-  const requestUrl = new URL(TDX_VD_URL);
-  if (route) requestUrl.searchParams.set("$filter", `contains(VDID,'${route}')`);
-  let response = await fetch(requestUrl, { headers });
-  // Some TDX deployments reject OData contains filters. Retrying the base endpoint keeps the feature available.
-  if (!response.ok && route) response = await fetch(TDX_VD_URL, { headers });
-  if (!response.ok) throw new Error(`TDX VD request failed (${response.status})`);
-  const payload = await response.json();
-  let records = asArray(payload?.VDLives || payload, "VDLive")
-    .filter((vd) => !route || routeFromVdId(vd?.VDID) === route);
-  // A few gateways accept an unsupported filter but return an empty 200 response.
-  if (route && !records.length && requestUrl.href !== TDX_VD_URL) {
-    const fallback = await fetch(TDX_VD_URL, { headers });
-    if (!fallback.ok) throw new Error(`TDX VD fallback request failed (${fallback.status})`);
-    const fallbackPayload = await fallback.json();
-    records = asArray(fallbackPayload?.VDLives || fallbackPayload, "VDLive")
-      .filter((vd) => routeFromVdId(vd?.VDID) === route);
-  }
-  vdCacheByRoute.set(route, { expiresAt: Date.now() + vdCacheMs, records });
-  return records;
+  const pending = vdRequestsByRoute.get(route);
+  if (pending) return pending;
+
+  const request = (async () => {
+    try {
+      const token = await getTdxAccessToken();
+      const headers = { Authorization: `Bearer ${token}` };
+      const requestUrl = new URL(TDX_VD_URL);
+      if (route) requestUrl.searchParams.set("$filter", `contains(VDID,'${route}')`);
+      let response = await fetch(requestUrl, { headers });
+      // Some TDX deployments reject OData contains filters. Retrying the base endpoint keeps the feature available.
+      if (!response.ok && route) response = await fetch(TDX_VD_URL, { headers });
+      if (!response.ok) throw new Error(`TDX VD request failed (${response.status})`);
+      const payload = await response.json();
+      let records = asArray(payload?.VDLives || payload, "VDLive")
+        .filter((vd) => !route || routeFromVdId(vd?.VDID) === route);
+      // A few gateways accept an unsupported filter but return an empty 200 response.
+      if (route && !records.length && requestUrl.href !== TDX_VD_URL) {
+        const fallback = await fetch(TDX_VD_URL, { headers });
+        if (!fallback.ok) throw new Error(`TDX VD fallback request failed (${fallback.status})`);
+        const fallbackPayload = await fallback.json();
+        records = asArray(fallbackPayload?.VDLives || fallbackPayload, "VDLive")
+          .filter((vd) => routeFromVdId(vd?.VDID) === route);
+      }
+      vdCacheByRoute.set(route, { expiresAt: Date.now() + vdCacheMs, records });
+      return records;
+    } catch (error) {
+      if (cached?.records?.length) {
+        // Keep the last verified official reading through a short TDX throttle
+        // window. Its source timestamp remains in the response for the client.
+        cached.expiresAt = Date.now() + vdRetryAfterFailureMs;
+        return cached.records;
+      }
+      throw error;
+    } finally {
+      vdRequestsByRoute.delete(route);
+    }
+  })();
+  vdRequestsByRoute.set(route, request);
+  return request;
 }
 
 async function getLaneObservation(cameraId, expectedMainLaneCount = null) {
