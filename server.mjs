@@ -2,6 +2,7 @@ import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, sta
 import { createServer } from "node:http";
 import { basename, extname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { buildScreenLaneReference, getCameraLaneMapping } from "./camera-lane-mapping.mjs";
 import { selectNearbyVd } from "./vd-selection.mjs";
 
 const port = Number(process.env.PORT || 8788);
@@ -461,6 +462,8 @@ async function getLaneObservation(cameraId, expectedMainLaneCount = null) {
   const mainFlow = nearest.mainFlow;
   const lanes = nearest.lanes;
   const mainLaneCount = nearest.mainLaneCount;
+  const screenLaneMapping = getCameraLaneMapping(camera.id);
+  const screenLaneReference = buildScreenLaneReference(lanes, screenLaneMapping);
   return {
     ok: true,
     updatedAt: new Date().toISOString(),
@@ -475,6 +478,17 @@ async function getLaneObservation(cameraId, expectedMainLaneCount = null) {
     mainLaneCount,
     lanes,
     flowReference: buildFlowReference(lanes),
+    screenLaneMapping: screenLaneMapping
+      ? {
+          state: screenLaneReference?.state || "incomplete",
+          mainLaneCount: screenLaneMapping.mainLaneCount,
+          basis: screenLaneMapping.basis,
+          excludedVdLaneIds: screenLaneMapping.excludedVdLaneIds || [],
+          excludedReason: screenLaneMapping.excludedReason || "",
+        }
+      : { state: "unmapped" },
+    screenLanes: screenLaneReference?.lanes || [],
+    screenFlowReference: screenLaneReference?.flowReference || { state: "insufficient" },
   };
 }
 
