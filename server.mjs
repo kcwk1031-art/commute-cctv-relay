@@ -115,8 +115,8 @@ function sendFile(response, file) {
   createReadStream(file).pipe(response);
 }
 
-async function getCameraCatalog() {
-  if (Date.now() < catalogCache.expiresAt) return catalogCache.cameras;
+async function getCameraCatalog(forceRefresh = false) {
+  if (!forceRefresh && Date.now() < catalogCache.expiresAt) return catalogCache.cameras;
 
   let entries;
   if (cameraCatalogUrl) {
@@ -128,11 +128,16 @@ async function getCameraCatalog() {
     entries = await getTdxCameras();
   }
 
+  // TDX occasionally returns a temporarily incomplete CCTV list. Merge a fresh
+  // response into the last known list so an already usable camera does not
+  // disappear from the client during that upstream fluctuation.
+  const merged = new Map(catalogCache.cameras);
+  for (const camera of entries.filter((item) => item?.id && /^https:\/\//i.test(String(item.mediaUrl || "")))) {
+    merged.set(String(camera.id), camera);
+  }
   catalogCache = {
     expiresAt: Date.now() + catalogCacheMs,
-    cameras: new Map(entries
-      .filter((camera) => camera?.id && /^https:\/\//i.test(String(camera.mediaUrl || "")))
-      .map((camera) => [String(camera.id), camera])),
+    cameras: merged,
   };
   return catalogCache.cameras;
 }
@@ -377,8 +382,12 @@ async function getTdxVdLives(route) {
 }
 
 async function getLaneObservation(cameraId, expectedMainLaneCount = null) {
-  const catalog = await getCameraCatalog();
-  const camera = catalog.get(String(cameraId));
+  let catalog = await getCameraCatalog();
+  let camera = catalog.get(String(cameraId));
+  if (!camera) {
+    catalog = await getCameraCatalog(true);
+    camera = catalog.get(String(cameraId));
+  }
   if (!camera) return { ok: false, error: "camera_not_found" };
 
   const route = routeFromCameraId(camera.id);
