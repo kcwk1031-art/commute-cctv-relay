@@ -2,6 +2,7 @@ import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, sta
 import { createServer } from "node:http";
 import { basename, extname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { selectNearbyVd } from "./vd-selection.mjs";
 
 const port = Number(process.env.PORT || 8788);
 const streamRoot = resolve(process.env.HLS_DIR || join(process.cwd(), "data"));
@@ -375,7 +376,7 @@ async function getTdxVdLives(route) {
   return records;
 }
 
-async function getLaneObservation(cameraId) {
+async function getLaneObservation(cameraId, expectedMainLaneCount = null) {
   const catalog = await getCameraCatalog();
   const camera = catalog.get(String(cameraId));
   if (!camera) return { ok: false, error: "camera_not_found" };
@@ -391,6 +392,9 @@ async function getLaneObservation(cameraId) {
     .map((vd) => {
       const mile = mileFromVdId(vd?.VDID);
       const linkFlows = normalizeLinkFlows(vd);
+      const mainFlow = [...linkFlows]
+        .sort((left, right) => right.lanes.filter(isMainlineLane).length - left.lanes.filter(isMainlineLane).length)[0];
+      const lanes = mainFlow?.lanes.sort((left, right) => Number(left.laneId) - Number(right.laneId)) || [];
       return {
         id: String(vd?.VDID || ""),
         direction: directionFromId(vd?.VDID),
@@ -398,13 +402,21 @@ async function getLaneObservation(cameraId) {
         status: Number(vd?.Status),
         dataCollectTime: vd?.DataCollectTime || vd?.UpdateTime || "",
         linkFlows,
+        mainFlow,
+        lanes,
+        mainLaneCount: lanes.filter(isMainlineLane).length,
         distanceKm: Number.isFinite(mile) ? Math.abs(mile - cameraMile) : Infinity,
       };
     })
     .filter((vd) => vd.direction === direction && vd.status === 0 && vd.linkFlows.length && Number.isFinite(vd.distanceKm))
     .sort((left, right) => left.distanceKm - right.distanceKm);
 
-  const nearest = candidates[0];
+  const expected = Number(expectedMainLaneCount);
+  const selection = selectNearbyVd(candidates, {
+    expectedMainLaneCount: Number.isInteger(expected) && expected > 0 ? expected : null,
+    maxDistanceKm: 3,
+  });
+  const nearest = selection.candidate;
   if (!nearest || nearest.distanceKm > 3) {
     return {
       ok: false,
@@ -413,10 +425,9 @@ async function getLaneObservation(cameraId) {
     };
   }
 
-  const mainFlow = [...nearest.linkFlows]
-    .sort((left, right) => right.lanes.filter(isMainlineLane).length - left.lanes.filter(isMainlineLane).length)[0];
-  const lanes = mainFlow.lanes.sort((left, right) => Number(left.laneId) - Number(right.laneId));
-  const mainLaneCount = lanes.filter(isMainlineLane).length;
+  const mainFlow = nearest.mainFlow;
+  const lanes = nearest.lanes;
+  const mainLaneCount = nearest.mainLaneCount;
   return {
     ok: true,
     updatedAt: new Date().toISOString(),
@@ -426,6 +437,7 @@ async function getLaneObservation(cameraId) {
       distanceKm: Number(nearest.distanceKm.toFixed(2)),
       dataCollectTime: nearest.dataCollectTime,
       linkId: mainFlow.linkId,
+      selection: selection.mode,
     },
     mainLaneCount,
     lanes,
@@ -645,7 +657,7 @@ const server = createServer((request, response) => {
   }
 
   const laneMatch = url.pathname.match(/^\/v1\/lanes\/([A-Za-z0-9_.-]+)$/);
-  if (laneMatch) return void getLaneObservation(laneMatch[1])
+  if (laneMatch) return void getLaneObservation(laneMatch[1], url.searchParams.get("mainLaneCount"))
     .then((observation) => sendJson(response, observation.ok ? 200 : 404, observation))
     .catch((error) => sendJson(response, 502, { ok: false, error: "lane_data_unavailable", detail: error.message }));
 
