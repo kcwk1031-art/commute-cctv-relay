@@ -38,17 +38,18 @@ export function buildScreenLaneReference(lanes, mapping) {
   const scored = [...screenLanes].sort((left, right) => Number(right.speedKph) - Number(left.speedKph));
   const [best, next] = scored;
   const speedGap = Number(best.speedKph) - Number(next.speedKph);
-  const flowReference = speedGap >= 5
-    ? {
-        state: "reference",
-        bestLaneId: best.laneId,
-        bestDisplayNumber: best.displayNumber,
-        detail: `官方 VD 顯示第 ${best.displayNumber} 車道 ${Math.round(best.speedKph)} km/h，較下一車道快 ${Math.round(speedGap)} km/h。僅供路況參考，不構成變換車道指令。`,
-      }
-    : {
-        state: "similar",
-        detail: "官方 VD 資料顯示各主線車道速度差異未達 5 km/h，維持目前車道較合適。",
-      };
+  const flowReference = {
+    // The operator requested a deterministic fastest-lane reference for the
+    // calibrated pilot. Confidence makes small differences visible without
+    // presenting them as a strong lane-change instruction.
+    state: "reference",
+    confidence: speedGap >= 5 ? "clear" : "minor",
+    bestLaneId: best.laneId,
+    bestDisplayNumber: best.displayNumber,
+    detail: speedGap >= 5
+      ? `官方 VD 顯示第 ${best.displayNumber} 車道 ${Math.round(best.speedKph)} km/h，較下一車道快 ${Math.round(speedGap)} km/h。僅供路況參考，不構成變換車道指令。`
+      : `官方 VD 顯示第 ${best.displayNumber} 車道 ${Math.round(best.speedKph)} km/h 為目前最高；與其他車道差異未達 5 km/h，僅供流況參考。`,
+  };
 
   return { state: "confirmed", lanes: screenLanes, flowReference };
 }

@@ -19,3 +19,10 @@ test("excludes the confirmed shoulder lane from the 65K+450 camera", () => {
   assert.deepEqual(result.lanes.map((item) => item.laneId), ["0", "1", "2"]);
   assert.equal(result.flowReference.bestLaneId, "1");
 });
+
+test("keeps a fastest-lane reference when the official speed gap is small", () => {
+  const result = buildScreenLaneReference([lane(0, 46), lane(1, 48), lane(2, 47)], getCameraLaneMapping("CCTV-N3-S-27.900-M"));
+  assert.equal(result.flowReference.state, "reference");
+  assert.equal(result.flowReference.confidence, "minor");
+  assert.equal(result.flowReference.bestDisplayNumber, 2);
+});
