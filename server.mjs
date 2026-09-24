@@ -16,7 +16,10 @@ const mjpegIdleMs = Math.max(5000, Number(process.env.MJPEG_IDLE_MS || 15000));
 const mjpegMaxClientBufferBytes = Math.max(256 * 1024, Number(process.env.MJPEG_MAX_CLIENT_BUFFER_BYTES || 1024 * 1024));
 const cameraCatalogUrl = String(process.env.CAMERA_CATALOG_URL || "").trim();
 const catalogCacheMs = 15 * 60 * 1000;
-const vdCacheMs = Math.max(30 * 1000, Number(process.env.VD_CACHE_MS || 120 * 1000));
+// TDX publishes VD dynamic data on a one-minute cadence. A short shared cache
+// lets active drivers see a new source record promptly without fanning out
+// repeated requests for the same freeway route.
+const vdCacheMs = Math.max(15 * 1000, Number(process.env.VD_CACHE_MS || 20 * 1000));
 const vdRetryAfterFailureMs = Math.max(10 * 1000, Number(process.env.VD_RETRY_AFTER_FAILURE_MS || 30 * 1000));
 const mjpegFpsWindowMs = Math.max(5 * 1000, Number(process.env.MJPEG_FPS_WINDOW_MS || 10 * 1000));
 const TDX_CCTV_URL = "https://tdx.transportdata.tw/api/basic/v2/Road/Traffic/CCTV/Freeway?$format=JSON";
